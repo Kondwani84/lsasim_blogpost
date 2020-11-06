@@ -1,0 +1,269 @@
+---
+title: "Parallel"
+author: "Kondwani Kajera Mughogho"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width = 90, tidy = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r, error=TRUE}
+ptm <- proc.time() # time the analysis
+
+library(lsasim)
+library(mvtnorm)
+library(mirt)
+```
+
+This is blogpost shows how to use the R package parallel. I will also show how much you save up on time by parallelizing your code. 
+
+First of all, I will specify my test characteristics. In this case, I will simulate a 45 item test which will be administered to 3000 examinees. The test simulations will be conducted over 3 replications. 
+```{r cars}
+
+n_examinees    <- 2000 # number of examinees
+total_items    <- 30 # total number of items
+no_reps        <- 12 # number of replications
+
+```
+
+I will then proceed on to generating my item parameters using R package lsasim. These item parameters will be from a 2 parameter-logistic model. In this case
+````{r lsasim, error = TRUE}
+items <- list() # specify an empty list for item parameters
+set.seed( round(5653) ) # seed for generated item parameters
+items <- lsasim::item_gen(n_2pl = total_items , 
+                          b_bounds = c(-2, 2), # boundeies for the item difficulty parameters
+                          a_bounds = c(0.75, 1.25) # bounderies for the item discrimination parameters
+                          ) 
+
+#--- combined sub-test items into a single data frame
+test_items <- items # save item parameters 
+
+````
+In this case, it is after generating the item parameters, I may then add everything that I intend on manipulate into a function. It is this function that will be distributed to parallel nodes. Note that in the function statement, I include all components of the simulation that are to fixed. These include: items, test_items, and total_items. One other key thing to note is that, the packages that will be used in your simulation should be loaded in the function as well. 
+
+```{r}
+#--- determine replications
+replications <- vector("list", no_reps) 
+for (rep in 1:no_reps) {
+  replications[[rep]] <- rep
+}
+
+myFunction <- function(X, items, test_items, 
+                       n_examinees, total_items, verbose = TRUE) {
+  # install packages
+  library(mirt)
+  library(mvtnorm)
+  library(lsasim)
+
+  # specify the number of replications
+  kk <- X
+  
+  #------------------------------------------------------------------------------#
+  ## Generate thetas 
+  #------------------------------------------------------------------------------#
+  theta <- rnorm(n_examinees, mean = 0, sd = 1)
+
+  #------------------------------------------------------------------------------#
+  # Generate item responses 
+  #------------------------------------------------------------------------------#
+  resp <- data.frame(matrix(NA, nrow= n_examinees, ncol = total_items))
+  colnames(resp) <- paste0("i.", 1:total_items)
+  
+  # assign items to block
+  block_bk1 <- lsasim::block_design(n_blocks = 1, 
+                                    item_parameters = items)
+  
+  #assign block to booklet
+  book_bk1 <- lsasim::booklet_design(item_block_assignment = 
+                                     block_bk1$block_assignment,
+                                     book_design = matrix(1))
+  #assign booklet to subjects
+  book_samp <- lsasim::booklet_sample(n_subj = n_examinees, 
+                                      book_item_design = book_bk1, 
+                                      book_prob = NULL)
+  
+  # generate item responses 
+  cog <- lsasim::response_gen(subject = book_samp$subject, 
+                              item = book_samp$item, 
+                              theta = theta, 
+                              b_par = items$b, 
+                              a_par = items$a)
+  
+  # extract item responses (excluding "subject" column)
+  resp <- cog[, c(1:total_items)]
+ 
+  #------------------------------------------------------------------------------#
+  # Fit IRT model
+  #------------------------------------------------------------------------------#
+  # specify the UIRT model
+  uirt_fit <- mirt::mirt(resp, 1, itemtype = "2PL", method = "QMCEM", 
+                         SE = TRUE, draws = 5000, verbose = FALSE)
+  
+  uirt_coef <- coef(uirt_fit, printSE = TRUE, IRTpars = T, simplify = T)
+  uirt_ip   <- uirt_coef$items
+
+  #------------------------------------------------------------------------------#
+  # Summarize and save estimated item parameters
+  #------------------------------------------------------------------------------#
+  est_ip <- data.frame(test_items,
+                       replication = kk, 
+                       uirt_ip)
+
+  #------------------------------------------------------------------------------#
+  # Scoring
+  #------------------------------------------------------------------------------#
+  # estimate uirt EAP scores 
+  uirt_score <- mirt::fscores( uirt_fit, method = "EAP", full.scores.SE=TRUE) 
+  score <- data.frame(  replication = kk,
+                        theta,
+                        uirt_score )
+
+  #------------------------------------------------------------------------------#
+  # Specify the output
+  #------------------------------------------------------------------------------#
+  output <- list( est_ip = est_ip, score = score )
+  return( output )
+}
+
+```
+
+After specifying the function, you may distribute a specific replication to a node on the computer.
+
+```{r}
+library(parallel) # load the package
+
+cl <- parallel::makeCluster(3) # specify the number of clusters. This is dependent on the number of nodes on the machine you are using.
+# serialize the analysis by sending it to multiple cores
+
+sim_output <- parallel::parLapply(cl, replications, myFunction, items = items, test_items = test_items, 
+                                  n_examinees = n_examinees, total_items = total_items)    # rename the stored results
+
+# rename each solution of the saved output based on its replication
+names(sim_output) <- paste0("r", 1:no_reps)
+
+# save the output to the folder
+save(sim_output, file = "sim_output.Rdata")
+
+# stop cluster
+stopCluster(cl)
+
+print(proc.time() - ptm) # obtain time
+```
+We may wish to compare this example with one where we do not parallelize. In this case, all the simulations are randomly specified to one  node simultaneously. 
+Using the same test conditions and specification:
+
+```{r}
+ptm <- proc.time() # time the analysis
+
+library(mirt)
+library(mvtnorm)
+library(lsasim)
+
+
+#------------------------------------------------------------------------------#
+# Build container 
+#------------------------------------------------------------------------------#
+n_examinees   <- 2000 # number of simulated examinees
+total_items   <- 30 # total number of items
+reps          <- 12 # number of replications
+
+# item_param_reps <- score_reps <-
+#   array(NA, 
+#         dim = c(reps, total_items), 
+#         dimnames = list(1:reps, paste0("i",1:total_items)))
+
+#------------------------------------------------------------------------------#
+## Generate item parameters
+#------------------------------------------------------------------------------#
+items <- list()
+set.seed( round(5653) ) # seed for generated item parameters
+items <- lsasim::item_gen(n_2pl = total_items , b_bounds = c(-2, 2), 
+                          a_bounds = c(0.75, 1.25))
+
+#--- combined sub-test items into a single data frame
+test_items <- items
+
+for (aa in 1:reps)
+{
+  
+  set.seed(68575 + 1 + reps)
+  #------------------------------------------------------------------------------#
+  ## Generate thetas 
+  #------------------------------------------------------------------------------#
+  theta <- rnorm(n_examinees, mean = 0, sd = 1)
+  
+  #------------------------------------------------------------------------------#
+  # Generate item responses 
+  #------------------------------------------------------------------------------#
+  resp <- data.frame(matrix(NA, nrow= n_examinees, ncol = total_items))
+  colnames(resp) <- paste0("i.", 1:total_items)
+  
+  # assign items to block
+  block_bk1 <- lsasim::block_design(n_blocks = 1, 
+                                    item_parameters = items)
+  
+  #assign block to booklet
+  book_bk1 <- lsasim::booklet_design(item_block_assignment = 
+                                       block_bk1$block_assignment,
+                                     book_design = matrix(1))
+  #assign booklet to subjects
+  book_samp <- lsasim::booklet_sample(n_subj = n_examinees, 
+                                      book_item_design = book_bk1, 
+                                      book_prob = NULL)
+  
+  # generate item responses 
+  cog <- lsasim::response_gen(subject = book_samp$subject, 
+                              item = book_samp$item, 
+                              theta = theta, 
+                              b_par = items$b, 
+                              a_par = items$a)
+  
+  # extract item responses (excluding "subject" column)
+  resp <- cog[, c(1:total_items)]
+  
+  #------------------------------------------------------------------------------#
+  # Fit IRT model
+  #------------------------------------------------------------------------------#
+  # specify the UIRT model
+  uirt_fit <- mirt::mirt(resp, 1, itemtype = "2PL", method = "QMCEM", 
+                         SE = TRUE, draws = 5000, verbose = FALSE)
+  
+  uirt_coef <- coef(uirt_fit, printSE = TRUE, IRTpars = T, simplify = T)
+  uirt_ip   <- uirt_coef$items
+  
+  #------------------------------------------------------------------------------#
+  # Summarize and save estimated item parameters
+  #------------------------------------------------------------------------------#
+  est_ip <- data.frame(test_items,
+                       replication = aa, 
+                       uirt_ip)
+  save(est_ip, file = paste0("est_ip_", aa, "_reps_", ".Rdata"))
+  
+  #------------------------------------------------------------------------------#
+  # Scoring
+  #------------------------------------------------------------------------------#
+  # estimate uirt EAP scores 
+  uirt_score <- mirt::fscores( uirt_fit, method = "EAP", full.scores.SE=TRUE) 
+  score <- data.frame(  replication = aa,
+                        theta,
+                        uirt_score )
+  
+  save(score, file = paste0("score_", aa, "_reps_", ".Rdata"))
+  
+  output <- list( est_ip = est_ip, score = score )
+  
+  
+  
+  
+}   # close the (aa in 1:reps)  loop
+
+save(output, file = "output.RData")
+
+
+print(proc.time() - ptm) # obtain time
+
+
+```
